@@ -6,6 +6,7 @@
   ],
   "routes": [
     { "src": "/api/events", "dest": "/api/events.py" },
+    { "src": "/api/summary", "dest": "/api/summary.py" },
     { "src": "/", "dest": "/index.html" }
   ]
 }

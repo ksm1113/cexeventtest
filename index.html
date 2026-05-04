@@ -6,22 +6,51 @@
 <link rel="icon" href="data:," />
 <title>CEX Events — Binance</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --modal-bg: white;
+    --modal-fg: #111;
+    --modal-border: rgba(0,0,0,0.1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --modal-bg: #1f1f1f; --modal-fg: #e8e8e8; --modal-border: rgba(255,255,255,0.15); }
+  }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
          max-width: 1200px; margin: 24px auto; padding: 0 16px; }
   header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
   h1 { font-size: 18px; margin: 0; }
   .actions { display: flex; gap: 8px; align-items: center; }
-  button { padding: 6px 12px; cursor: pointer; border: 1px solid #888; background: transparent; border-radius: 4px; }
+  button { padding: 6px 12px; cursor: pointer; border: 1px solid #888; background: transparent; border-radius: 4px; color: inherit; font-size: 13px; }
   button:hover { background: rgba(128,128,128,0.1); }
   table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 13px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,0.25); vertical-align: top; }
   th { background: rgba(128,128,128,0.08); font-weight: 600; }
-  td a { color: inherit; }
   .tag { display: inline-block; padding: 1px 6px; background: rgba(80,120,255,0.15); border-radius: 3px; margin: 1px 2px 1px 0; font-size: 11px; }
   .muted { color: rgba(128,128,128,0.9); font-size: 12px; }
   .err { color: #c33; }
   .empty { text-align: center; padding: 30px; }
+
+  .title-btn { all: unset; cursor: pointer; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+  .title-btn:hover { color: #4a73d8; }
+
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    display: none; align-items: center; justify-content: center; z-index: 100;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--modal-bg); color: var(--modal-fg);
+    max-width: 640px; width: 90%; max-height: 80vh; overflow: auto;
+    padding: 20px 24px; border-radius: 10px;
+    border: 1px solid var(--modal-border);
+    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+  }
+  .modal h3 { margin: 0 0 12px; font-size: 15px; line-height: 1.4; }
+  .modal-summary { white-space: pre-wrap; line-height: 1.6; font-size: 14px; }
+  .modal-loading { text-align: center; padding: 30px; color: rgba(128,128,128,0.9); }
+  .modal-error { color: #c33; padding: 12px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; align-items: center; }
+  .modal-actions a { font-size: 13px; }
 </style>
 </head>
 <body>
@@ -43,12 +72,23 @@
   <tbody></tbody>
 </table>
 
+<div id="modal-backdrop" class="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal">
+    <h3 id="modal-title">Loading…</h3>
+    <div id="modal-body" class="modal-loading">요약 불러오는 중…</div>
+    <div class="modal-actions">
+      <a id="modal-link" href="#" target="_blank" rel="noopener" style="display:none">원문 보기 ↗</a>
+      <button id="modal-close">닫기</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const REFRESH_MS = 60000;
 let pendingController = null;
+let currentEvents = [];
 
 async function load() {
-  // Cancel any in-flight fetch so a late response can't overwrite a newer one.
   if (pendingController) pendingController.abort();
   const ctrl = new AbortController();
   pendingController = ctrl;
@@ -57,10 +97,11 @@ async function load() {
     const r = await fetch('/api/events', { cache: 'no-store', signal: ctrl.signal });
     const j = await r.json();
     if (!j.ok) throw new Error(j.error || 'unknown error');
-    render(j.events || []);
+    currentEvents = j.events || [];
+    render(currentEvents);
     setStatus('Updated ' + new Date().toLocaleTimeString() + '  (' + (j.count ?? 0) + ' / ' + (j.raw_count ?? 0) + ' matched)');
   } catch (e) {
-    if (e.name === 'AbortError') return;  // expected when superseded
+    if (e.name === 'AbortError') return;
     setStatus('<span class="err">Error: ' + esc(e.message) + '</span>', true);
   } finally {
     if (pendingController === ctrl) pendingController = null;
@@ -73,9 +114,9 @@ function render(events) {
     tb.innerHTML = '<tr><td colspan="5" class="empty muted">No matching events.</td></tr>';
     return;
   }
-  tb.innerHTML = events.map(e => `
+  tb.innerHTML = events.map((e, i) => `
     <tr>
-      <td>${e.url ? `<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.title)}</a>` : esc(e.title)}</td>
+      <td><button class="title-btn" data-idx="${i}">${esc(e.title)}</button></td>
       <td>${esc(e.category)}</td>
       <td>${(e.matched || []).map(m => `<span class="tag">${esc(m)}</span>`).join('')}</td>
       <td>${e.apy_hint ? esc(e.apy_hint) + '%' : ''}</td>
@@ -102,6 +143,77 @@ function formatDate(iso) {
   if (isNaN(d)) return iso;
   return d.toISOString().slice(0, 16).replace('T', ' ') + 'Z';
 }
+
+function getCode(url) {
+  if (!url) return null;
+  const m = url.match(/\/announcement\/([^?#/]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+function openSummary(ev) {
+  const backdrop = document.getElementById('modal-backdrop');
+  const titleEl = document.getElementById('modal-title');
+  const bodyEl = document.getElementById('modal-body');
+  const linkEl = document.getElementById('modal-link');
+
+  titleEl.textContent = ev.title || '';
+  linkEl.href = ev.url || '#';
+  linkEl.style.display = ev.url ? 'inline' : 'none';
+  bodyEl.className = 'modal-loading';
+  bodyEl.textContent = '요약 불러오는 중…';
+  backdrop.classList.add('open');
+
+  const code = getCode(ev.url);
+  if (!code) {
+    bodyEl.className = 'modal-error';
+    bodyEl.textContent = 'Article code 없음 — 요약 불가';
+    return;
+  }
+
+  const cacheKey = 'summary:' + code;
+  const cached = sessionStorage.getItem(cacheKey);
+  if (cached) {
+    try { showSummary(JSON.parse(cached)); return; } catch (_) { /* fallthrough */ }
+  }
+
+  fetch('/api/summary?code=' + encodeURIComponent(code))
+    .then(r => r.json())
+    .then(j => {
+      if (!j.ok) throw new Error(j.error || 'unknown error');
+      sessionStorage.setItem(cacheKey, JSON.stringify(j));
+      showSummary(j);
+    })
+    .catch(e => {
+      bodyEl.className = 'modal-error';
+      bodyEl.textContent = 'Error: ' + e.message;
+    });
+}
+
+function showSummary(j) {
+  const bodyEl = document.getElementById('modal-body');
+  bodyEl.className = 'modal-summary';
+  bodyEl.textContent = j.summary || '(empty summary)';
+}
+
+function closeSummary() {
+  document.getElementById('modal-backdrop').classList.remove('open');
+}
+
+// Event delegation: title button click → open modal
+document.querySelector('#events tbody').addEventListener('click', e => {
+  const btn = e.target.closest('.title-btn');
+  if (!btn) return;
+  const idx = parseInt(btn.dataset.idx, 10);
+  if (Number.isInteger(idx) && currentEvents[idx]) openSummary(currentEvents[idx]);
+});
+
+document.getElementById('modal-close').addEventListener('click', closeSummary);
+document.getElementById('modal-backdrop').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeSummary();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSummary();
+});
 
 document.getElementById('refresh').addEventListener('click', load);
 load();
