@@ -27,7 +27,7 @@ GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
-TIMEOUT_PAGE_SEC = 3
+TIMEOUT_PAGE_SEC = 4  # ScrapingAnt browser=true takes ~2-3s for JS render
 TIMEOUT_GEMINI_SEC = 3  # per model attempt
 MAX_BODY_CHARS = 3500  # smaller body → faster Gemini response
 
@@ -85,12 +85,13 @@ def fetch_binance_page(code: str) -> str:
         raise RuntimeError("SCRAPINGANT_API_KEY env var not set")
 
     target_url = BINANCE_PAGE_URL.format(code=urllib.parse.quote(code, safe="-_.~"))
-    # browser=false uses 1 credit instead of 10. Binance announcement pages
-    # are SSR — JS rendering not needed.
+    # browser=true (10 credits/req → ~100 req/month on free tier). JS render
+    # required because the Binance page hydrates content client-side even
+    # though _NEXT_DATA_ is server-rendered.
     sa_url = SCRAPINGANT_URL + "?" + urllib.parse.urlencode({
         "url": target_url,
         "x-api-key": api_key,
-        "browser": "false",
+        "browser": "true",
     })
     req = urllib.request.Request(sa_url, headers={
         "Accept": "text/html,*/*",
