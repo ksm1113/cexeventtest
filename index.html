@@ -170,17 +170,12 @@ function openSummary(ev) {
     return;
   }
 
-  const cacheKey = 'summary:' + code;
-  const cached = sessionStorage.getItem(cacheKey);
-  if (cached) {
-    try { showSummary(JSON.parse(cached)); return; } catch (_) { /* fallthrough */ }
-  }
-
-  fetch('/api/summary?code=' + encodeURIComponent(code))
+  // Always fetch fresh — bypass HTTP cache so users see latest output
+  // (especially relevant during iteration on the backend logic).
+  fetch('/api/summary?code=' + encodeURIComponent(code), { cache: 'no-store' })
     .then(r => r.json())
     .then(j => {
       if (!j.ok) throw new Error(j.error || 'unknown error');
-      sessionStorage.setItem(cacheKey, JSON.stringify(j));
       showSummary(j);
     })
     .catch(e => {
