@@ -1,0 +1,6 @@
+[project]
+name = "cex-events"
+version = "0.1.0"
+description = "Binance event feed — rule-matched CEX announcements"
+requires-python = ">=3.12"
+dependencies = []
