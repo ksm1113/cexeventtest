@@ -51,10 +51,21 @@ Body:
 
 
 # --- HTTP helpers ---
-def _json_request(req: urllib.request.Request, timeout: int) -> dict:
-    """Single-attempt HTTP+JSON. Raises on any failure."""
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _json_request(req: urllib.request.Request, timeout: int, label: str) -> dict:
+    """Single-attempt HTTP+JSON. Wraps errors with label + response body
+    snippet so the frontend can identify which upstream failed.
+    """
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            snippet = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            snippet = ""
+        raise RuntimeError(f"{label}: HTTP {e.code} — {snippet}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(f"{label}: {e.__class__.__name__}: {e}") from e
 
 
 # --- Binance detail ---
@@ -65,7 +76,7 @@ def fetch_binance_detail(code: str) -> dict:
         "Accept": "application/json",
         "Accept-Encoding": "identity",
     })
-    return _json_request(req, TIMEOUT_BINANCE_SEC)
+    return _json_request(req, TIMEOUT_BINANCE_SEC, "binance detail")
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -104,7 +115,7 @@ def call_gemini(prompt: str, api_key: str) -> str:
             "Accept-Encoding": "identity",
         },
     )
-    resp = _json_request(req, TIMEOUT_GEMINI_SEC)
+    resp = _json_request(req, TIMEOUT_GEMINI_SEC, "gemini")
     candidates = resp.get("candidates") or []
     if not candidates:
         raise RuntimeError("gemini returned no candidates")
