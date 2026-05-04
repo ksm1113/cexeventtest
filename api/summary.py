@@ -3,17 +3,15 @@
 GET /api/summary?code=<article_code>
 Response: { ok: true, title: "...", summary: "..." } or { ok: false, error: "..." }
 
-Binance returns a JS shell to bare datacenter requests; the rendered HTML
-shows up only when proper browser headers AND a session cookie from a prior
-visit are present. So we do a cookie warm-up GET on the home page first,
-then fetch the announcement page through the same opener so cookies travel.
+Direct fetch from Vercel datacenter IPs is blocked by Binance's bot
+defense. We route the announcement page through ScrapingAnt's residential
+proxy network (free tier: 1000 req/month with browser=false).
 
 Vercel Hobby plan caps total duration at 10s. Budget:
-  warm-up 2s + announcement 3s + gemini 4s = 9s worst.
+  scrapingant 4s + gemini-primary 3s + gemini-fallback 3s = 10s worst.
 """
 from __future__ import annotations
 
-import http.cookiejar
 import json
 import os
 import re
@@ -24,14 +22,12 @@ from http.server import BaseHTTPRequestHandler
 
 # --- Config ---
 BINANCE_PAGE_URL = "https://www.binance.com/en/support/announcement/{code}"
-BINANCE_HOME_URL = "https://www.binance.com/en"
-# Try newer model first; fall back to 2.0-flash if it returns 503/UNAVAILABLE.
+SCRAPINGANT_URL = "https://api.scrapingant.com/v2/general"
 GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
-TIMEOUT_HOME_SEC = 1
-TIMEOUT_PAGE_SEC = 3
+TIMEOUT_PAGE_SEC = 4
 TIMEOUT_GEMINI_SEC = 3  # per model attempt
 MAX_BODY_CHARS = 6000
 
@@ -56,25 +52,6 @@ Body:
 {body}
 """
 
-_COMMON_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "identity",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "no-cache",
-}
-
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 _SCRIPT_BLOCK_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
@@ -87,21 +64,9 @@ _TITLE_RE = re.compile(r"<title>([^<]+)</title>", re.IGNORECASE)
 
 
 # --- HTTP helpers ---
-def _build_opener() -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
-    )
-
-
-def _http_request(
-    req: urllib.request.Request,
-    timeout: int,
-    label: str,
-    opener: urllib.request.OpenerDirector | None = None,
-) -> bytes:
-    open_fn = opener.open if opener is not None else urllib.request.urlopen
+def _http_request(req: urllib.request.Request, timeout: int, label: str) -> bytes:
     try:
-        with open_fn(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
         try:
@@ -113,29 +78,25 @@ def _http_request(
         raise RuntimeError(f"{label}: {e.__class__.__name__}: {e}") from e
 
 
-# --- Binance HTML page ---
+# --- Binance page via ScrapingAnt ---
 def fetch_binance_page(code: str) -> str:
-    url = BINANCE_PAGE_URL.format(code=urllib.parse.quote(code, safe="-_.~"))
-    opener = _build_opener()
+    api_key = os.environ.get("SCRAPINGANT_API_KEY")
+    if not api_key:
+        raise RuntimeError("SCRAPINGANT_API_KEY env var not set")
 
-    # Step 1: warm-up — home page sets session cookies. Failures here are
-    # non-fatal; we still try the announcement page.
-    home_headers = {**_COMMON_BROWSER_HEADERS, "Sec-Fetch-Site": "none"}
-    home_req = urllib.request.Request(BINANCE_HOME_URL, headers=home_headers)
-    try:
-        with opener.open(home_req, timeout=TIMEOUT_HOME_SEC) as r:
-            r.read(2048)  # discard body — only cookies matter
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        pass
-
-    # Step 2: announcement page — same opener, cookies travel automatically.
-    page_headers = {
-        **_COMMON_BROWSER_HEADERS,
-        "Sec-Fetch-Site": "same-origin",
-        "Referer": BINANCE_HOME_URL,
-    }
-    req = urllib.request.Request(url, headers=page_headers)
-    raw = _http_request(req, TIMEOUT_PAGE_SEC, "binance html", opener=opener)
+    target_url = BINANCE_PAGE_URL.format(code=urllib.parse.quote(code, safe="-_.~"))
+    # browser=false uses 1 credit instead of 10. Binance announcement pages
+    # are SSR — JS rendering not needed.
+    sa_url = SCRAPINGANT_URL + "?" + urllib.parse.urlencode({
+        "url": target_url,
+        "x-api-key": api_key,
+        "browser": "false",
+    })
+    req = urllib.request.Request(sa_url, headers={
+        "Accept": "text/html,*/*",
+        "Accept-Encoding": "identity",
+    })
+    raw = _http_request(req, TIMEOUT_PAGE_SEC, "scrapingant")
     return raw.decode("utf-8", errors="replace")
 
 
