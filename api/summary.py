@@ -23,12 +23,14 @@ from http.server import BaseHTTPRequestHandler
 # --- Config ---
 BINANCE_PAGE_URL = "https://www.binance.com/en/support/announcement/{code}"
 SCRAPINGANT_URL = "https://api.scrapingant.com/v2/general"
-GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
+# Single model — fallback dropped to fit ScrapingAnt JS-render time within
+# Vercel's 10s cap. On 503/UNAVAILABLE the user re-clicks.
+GEMINI_MODELS = ("gemini-2.5-flash",)
 GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
-TIMEOUT_PAGE_SEC = 4  # ScrapingAnt browser=true takes ~2-3s for JS render
-TIMEOUT_GEMINI_SEC = 3  # per model attempt
+TIMEOUT_PAGE_SEC = 5  # ScrapingAnt browser=true JS render
+TIMEOUT_GEMINI_SEC = 4  # single attempt
 MAX_BODY_CHARS = 3500  # smaller body → faster Gemini response
 
 PROMPT_TEMPLATE = """\
