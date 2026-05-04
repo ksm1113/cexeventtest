@@ -27,9 +27,9 @@ GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
-TIMEOUT_PAGE_SEC = 4
+TIMEOUT_PAGE_SEC = 3
 TIMEOUT_GEMINI_SEC = 3  # per model attempt
-MAX_BODY_CHARS = 6000
+MAX_BODY_CHARS = 3500  # smaller body → faster Gemini response
 
 PROMPT_TEMPLATE = """\
 다음은 Binance announcement 페이지에서 추출한 영어 본문이다.
@@ -171,7 +171,7 @@ def _call_gemini_model(model: str, prompt: str, api_key: str) -> str:
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
     }
     req = urllib.request.Request(
         url,
