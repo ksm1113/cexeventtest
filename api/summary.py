@@ -3,9 +3,14 @@
 GET /api/summary?code=<article_code>
 Response: { ok: true, title: "...", summary: "..." } or { ok: false, error: "..." }
 
-Vercel Hobby plan caps total duration at 10s. Both upstream calls (Binance
-detail + Gemini) must fit inside that, so we run a single attempt per call
-with conservative timeouts. Retry is handled by user re-click on the UI side.
+The bapi detail endpoint is not part of any public API surface (the
+announcement page is server-rendered, so the browser never makes a detail
+XHR). Instead we fetch the SSR HTML page and extract the article body —
+preferring Next.js __NEXT_DATA__ JSON when present, falling back to
+stripping all tags.
+
+Vercel Hobby plan caps total duration at 10s, so each upstream call runs
+once with a conservative timeout. User re-clicks for retries.
 """
 from __future__ import annotations
 
@@ -18,28 +23,27 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler
 
 # --- Config ---
-BINANCE_DETAIL_URL = (
-    "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
-)
+BINANCE_PAGE_URL = "https://www.binance.com/en/support/announcement/{code}"
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
-TIMEOUT_BINANCE_SEC = 3
-TIMEOUT_GEMINI_SEC = 5
-MAX_BODY_CHARS = 4000  # cap LLM input to keep latency/cost low
+TIMEOUT_HTML_SEC = 5
+TIMEOUT_GEMINI_SEC = 4
+MAX_BODY_CHARS = 6000  # cap LLM input
 
 PROMPT_TEMPLATE = """\
-다음은 Binance announcement 영어 본문이다. 한국어로 핵심만 3~5줄로 요약해라.
+다음은 Binance announcement 페이지에서 추출한 영어 본문이다.
+페이지 navigation/footer 같은 noise가 섞여 있을 수 있으니, announcement 핵심 정보만 골라 한국어로 3~5줄 요약해라.
 
 포함할 정보:
-- 어떤 종류 이벤트 (Launchpool / Earn / 입금 보너스 / 신규 상장 / 거래 대회 등)
+- 어떤 종류 이벤트 (Launchpool / Earn / 입금 보너스 / 신규 상장 / 거래 대회 / 펀딩 등)
 - 참여 조건 (자산, 락업 기간, 최소 금액 등)
 - 보상 (APR, 보너스 금액, 토큰량 등)
 - 마감일 또는 시작일
 
 규칙:
-- 사실만. 본문에 없는 정보는 추측 금지
+- 사실만. 본문에 없는 정보 추측 금지
 - 사견 / 평가 금지
 - 짧게
 
@@ -49,15 +53,22 @@ Body:
 {body}
 """
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+_SCRIPT_BLOCK_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+_STYLE_BLOCK_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.+?)</script>',
+    re.DOTALL,
+)
+_TITLE_RE = re.compile(r"<title>([^<]+)</title>", re.IGNORECASE)
+
 
 # --- HTTP helpers ---
-def _json_request(req: urllib.request.Request, timeout: int, label: str) -> dict:
-    """Single-attempt HTTP+JSON. Wraps errors with label + response body
-    snippet so the frontend can identify which upstream failed.
-    """
+def _http_request(req: urllib.request.Request, timeout: int, label: str) -> bytes:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return resp.read()
     except urllib.error.HTTPError as e:
         try:
             snippet = e.read().decode("utf-8", errors="replace")[:300]
@@ -68,36 +79,86 @@ def _json_request(req: urllib.request.Request, timeout: int, label: str) -> dict
         raise RuntimeError(f"{label}: {e.__class__.__name__}: {e}") from e
 
 
-# --- Binance detail ---
-def fetch_binance_detail(code: str) -> dict:
-    url = f"{BINANCE_DETAIL_URL}?code={urllib.parse.quote(code, safe='-_.~')}"
+# --- Binance HTML page ---
+def fetch_binance_page(code: str) -> str:
+    url = BINANCE_PAGE_URL.format(code=urllib.parse.quote(code, safe="-_.~"))
     req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; cex-event-feed/0.1)",
-        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "identity",
     })
-    return _json_request(req, TIMEOUT_BINANCE_SEC, "binance detail")
+    raw = _http_request(req, TIMEOUT_HTML_SEC, "binance html")
+    return raw.decode("utf-8", errors="replace")
 
 
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_WHITESPACE_RE = re.compile(r"\s+")
+# --- Body extraction ---
+def _strip_html(s: str) -> str:
+    s = _SCRIPT_BLOCK_RE.sub(" ", s)
+    s = _STYLE_BLOCK_RE.sub(" ", s)
+    s = _HTML_TAG_RE.sub(" ", s)
+    return _WHITESPACE_RE.sub(" ", s).strip()
 
 
-def extract_body(payload: dict) -> tuple[str, str]:
-    """Return (title, body_text) from Binance detail payload.
-
-    Body field name varies between endpoint versions — try common candidates.
+def _walk_for_article(node, depth: int = 0):
+    """Depth-first search for {body|content: <html string>, title: <string>} dict
+    inside arbitrary JSON. Returns (title, plain_text_body) or (None, None).
     """
-    data = payload.get("data") or {}
-    title = data.get("title", "") or ""
-    body = data.get("body") or data.get("content") or data.get("brief") or ""
-    if isinstance(body, list):
-        body = " ".join(str(b) for b in body if b)
-    body = _HTML_TAG_RE.sub(" ", str(body))
-    body = _WHITESPACE_RE.sub(" ", body).strip()
-    if len(body) > MAX_BODY_CHARS:
-        body = body[:MAX_BODY_CHARS] + "..."
-    return title, body
+    if depth > 12:  # bound recursion
+        return None, None
+    if isinstance(node, dict):
+        for body_key in ("body", "content"):
+            body = node.get(body_key)
+            if isinstance(body, str) and len(body) >= 100:
+                text = _strip_html(body)
+                if text:
+                    title = node.get("title") if isinstance(node.get("title"), str) else ""
+                    return title, text
+        for v in node.values():
+            t, b = _walk_for_article(v, depth + 1)
+            if b:
+                return t, b
+    elif isinstance(node, list):
+        for v in node:
+            t, b = _walk_for_article(v, depth + 1)
+            if b:
+                return t, b
+    return None, None
+
+
+def extract_article(html: str) -> tuple[str, str]:
+    """Return (title, body_text). Prefer __NEXT_DATA__ JSON; fall back to
+    raw HTML strip. Raises if body cannot be located.
+    """
+    # Strategy 1: __NEXT_DATA__ (Next.js SSR standard)
+    m = _NEXT_DATA_RE.search(html)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            title, body = _walk_for_article(data)
+            if body:
+                if len(body) > MAX_BODY_CHARS:
+                    body = body[:MAX_BODY_CHARS] + "..."
+                if not title:
+                    tm = _TITLE_RE.search(html)
+                    title = tm.group(1).strip() if tm else ""
+                return title, body
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # Strategy 2: full HTML strip fallback
+    tm = _TITLE_RE.search(html)
+    title = tm.group(1).strip() if tm else ""
+    text = _strip_html(html)
+    if not text:
+        raise RuntimeError("could not extract any text from HTML")
+    if len(text) > MAX_BODY_CHARS:
+        text = text[:MAX_BODY_CHARS] + "..."
+    return title, text
 
 
 # --- Gemini ---
@@ -115,14 +176,15 @@ def call_gemini(prompt: str, api_key: str) -> str:
             "Accept-Encoding": "identity",
         },
     )
-    resp = _json_request(req, TIMEOUT_GEMINI_SEC, "gemini")
+    raw = _http_request(req, TIMEOUT_GEMINI_SEC, "gemini")
+    resp = json.loads(raw.decode("utf-8"))
     candidates = resp.get("candidates") or []
     if not candidates:
-        raise RuntimeError("gemini returned no candidates")
+        raise RuntimeError(f"gemini: no candidates — {str(resp)[:300]}")
     parts = candidates[0].get("content", {}).get("parts", []) or []
     text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
     if not text.strip():
-        raise RuntimeError("gemini returned empty text")
+        raise RuntimeError("gemini: empty text")
     return text.strip()
 
 
@@ -131,8 +193,8 @@ def summarize(code: str) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY env var not set")
-    detail = fetch_binance_detail(code)
-    title, body = extract_body(detail)
+    html = fetch_binance_page(code)
+    title, body = extract_article(html)
     if not body:
         raise RuntimeError("article body is empty — cannot summarize")
     prompt = PROMPT_TEMPLATE.format(title=title, body=body)
