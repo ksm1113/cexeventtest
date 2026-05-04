@@ -25,13 +25,14 @@ from http.server import BaseHTTPRequestHandler
 # --- Config ---
 BINANCE_PAGE_URL = "https://www.binance.com/en/support/announcement/{code}"
 BINANCE_HOME_URL = "https://www.binance.com/en"
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# Try newer model first; fall back to 2.0-flash if it returns 503/UNAVAILABLE.
+GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
+GEMINI_URL_TEMPLATE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
-TIMEOUT_HOME_SEC = 2
+TIMEOUT_HOME_SEC = 1
 TIMEOUT_PAGE_SEC = 3
-TIMEOUT_GEMINI_SEC = 4
+TIMEOUT_GEMINI_SEC = 3  # per model attempt
 MAX_BODY_CHARS = 6000
 
 PROMPT_TEMPLATE = """\
@@ -202,8 +203,11 @@ def extract_article(html: str) -> tuple[str, str]:
 
 
 # --- Gemini ---
-def call_gemini(prompt: str, api_key: str) -> str:
-    url = f"{GEMINI_URL}?key={urllib.parse.quote(api_key, safe='')}"
+def _call_gemini_model(model: str, prompt: str, api_key: str) -> str:
+    url = (
+        GEMINI_URL_TEMPLATE.format(model=model)
+        + f"?key={urllib.parse.quote(api_key, safe='')}"
+    )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600},
@@ -216,16 +220,33 @@ def call_gemini(prompt: str, api_key: str) -> str:
             "Accept-Encoding": "identity",
         },
     )
-    raw = _http_request(req, TIMEOUT_GEMINI_SEC, "gemini")
+    raw = _http_request(req, TIMEOUT_GEMINI_SEC, f"gemini ({model})")
     resp = json.loads(raw.decode("utf-8"))
     candidates = resp.get("candidates") or []
     if not candidates:
-        raise RuntimeError(f"gemini: no candidates — {str(resp)[:300]}")
+        raise RuntimeError(f"gemini ({model}): no candidates — {str(resp)[:300]}")
     parts = candidates[0].get("content", {}).get("parts", []) or []
     text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
     if not text.strip():
-        raise RuntimeError("gemini: empty text")
+        raise RuntimeError(f"gemini ({model}): empty text")
     return text.strip()
+
+
+def call_gemini(prompt: str, api_key: str) -> str:
+    """Try models in order; fall back only on transient overload errors
+    (503 UNAVAILABLE / 429 RESOURCE_EXHAUSTED).
+    """
+    last_err: Exception | None = None
+    for model in GEMINI_MODELS:
+        try:
+            return _call_gemini_model(model, prompt, api_key)
+        except RuntimeError as e:
+            msg = str(e)
+            if "503" not in msg and "UNAVAILABLE" not in msg \
+                    and "429" not in msg and "RESOURCE_EXHAUSTED" not in msg:
+                raise
+            last_err = e
+    raise last_err if last_err else RuntimeError("all gemini models failed")
 
 
 # --- Pipeline ---
