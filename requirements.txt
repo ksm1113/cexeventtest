@@ -1,0 +1,2 @@
+# Vercel Python runtime requires this file to detect Python project.
+# Currently using only Python standard library — no third-party packages.
