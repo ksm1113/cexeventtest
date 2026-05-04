@@ -3,17 +3,17 @@
 GET /api/summary?code=<article_code>
 Response: { ok: true, title: "...", summary: "..." } or { ok: false, error: "..." }
 
-The bapi detail endpoint is not part of any public API surface (the
-announcement page is server-rendered, so the browser never makes a detail
-XHR). Instead we fetch the SSR HTML page and extract the article body —
-preferring Next.js __NEXT_DATA__ JSON when present, falling back to
-stripping all tags.
+Binance returns a JS shell to bare datacenter requests; the rendered HTML
+shows up only when proper browser headers AND a session cookie from a prior
+visit are present. So we do a cookie warm-up GET on the home page first,
+then fetch the announcement page through the same opener so cookies travel.
 
-Vercel Hobby plan caps total duration at 10s, so each upstream call runs
-once with a conservative timeout. User re-clicks for retries.
+Vercel Hobby plan caps total duration at 10s. Budget:
+  warm-up 2s + announcement 3s + gemini 4s = 9s worst.
 """
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import os
 import re
@@ -24,13 +24,15 @@ from http.server import BaseHTTPRequestHandler
 
 # --- Config ---
 BINANCE_PAGE_URL = "https://www.binance.com/en/support/announcement/{code}"
+BINANCE_HOME_URL = "https://www.binance.com/en"
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
-TIMEOUT_HTML_SEC = 5
+TIMEOUT_HOME_SEC = 2
+TIMEOUT_PAGE_SEC = 3
 TIMEOUT_GEMINI_SEC = 4
-MAX_BODY_CHARS = 6000  # cap LLM input
+MAX_BODY_CHARS = 6000
 
 PROMPT_TEMPLATE = """\
 다음은 Binance announcement 페이지에서 추출한 영어 본문이다.
@@ -53,6 +55,25 @@ Body:
 {body}
 """
 
+_COMMON_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
+}
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 _SCRIPT_BLOCK_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
@@ -65,9 +86,21 @@ _TITLE_RE = re.compile(r"<title>([^<]+)</title>", re.IGNORECASE)
 
 
 # --- HTTP helpers ---
-def _http_request(req: urllib.request.Request, timeout: int, label: str) -> bytes:
+def _build_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+
+
+def _http_request(
+    req: urllib.request.Request,
+    timeout: int,
+    label: str,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> bytes:
+    open_fn = opener.open if opener is not None else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_fn(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
         try:
@@ -82,29 +115,26 @@ def _http_request(req: urllib.request.Request, timeout: int, label: str) -> byte
 # --- Binance HTML page ---
 def fetch_binance_page(code: str) -> str:
     url = BINANCE_PAGE_URL.format(code=urllib.parse.quote(code, safe="-_.~"))
-    # Full Chrome-style top-level navigation header set. Binance returns a JS
-    # shell to bare requests but a fully rendered page when these are present.
-    req = urllib.request.Request(url, headers={
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "image/avif,image/webp,image/apng,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    })
-    raw = _http_request(req, TIMEOUT_HTML_SEC, "binance html")
+    opener = _build_opener()
+
+    # Step 1: warm-up — home page sets session cookies. Failures here are
+    # non-fatal; we still try the announcement page.
+    home_headers = {**_COMMON_BROWSER_HEADERS, "Sec-Fetch-Site": "none"}
+    home_req = urllib.request.Request(BINANCE_HOME_URL, headers=home_headers)
+    try:
+        with opener.open(home_req, timeout=TIMEOUT_HOME_SEC) as r:
+            r.read(2048)  # discard body — only cookies matter
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        pass
+
+    # Step 2: announcement page — same opener, cookies travel automatically.
+    page_headers = {
+        **_COMMON_BROWSER_HEADERS,
+        "Sec-Fetch-Site": "same-origin",
+        "Referer": BINANCE_HOME_URL,
+    }
+    req = urllib.request.Request(url, headers=page_headers)
+    raw = _http_request(req, TIMEOUT_PAGE_SEC, "binance html", opener=opener)
     return raw.decode("utf-8", errors="replace")
 
 
@@ -117,10 +147,10 @@ def _strip_html(s: str) -> str:
 
 
 def _walk_for_article(node, depth: int = 0):
-    """Depth-first search for {body|content: <html string>, title: <string>} dict
-    inside arbitrary JSON. Returns (title, plain_text_body) or (None, None).
+    """DFS for a dict that has body|content (HTML string ≥100 chars)
+    plus optional title. Returns (title, plain_text_body) or (None, None).
     """
-    if depth > 12:  # bound recursion
+    if depth > 12:
         return None, None
     if isinstance(node, dict):
         for body_key in ("body", "content"):
@@ -144,9 +174,8 @@ def _walk_for_article(node, depth: int = 0):
 
 def extract_article(html: str) -> tuple[str, str]:
     """Return (title, body_text). Prefer __NEXT_DATA__ JSON; fall back to
-    raw HTML strip. Raises if body cannot be located.
+    raw HTML strip.
     """
-    # Strategy 1: __NEXT_DATA__ (Next.js SSR standard)
     m = _NEXT_DATA_RE.search(html)
     if m:
         try:
@@ -162,7 +191,6 @@ def extract_article(html: str) -> tuple[str, str]:
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
-    # Strategy 2: full HTML strip fallback
     tm = _TITLE_RE.search(html)
     title = tm.group(1).strip() if tm else ""
     text = _strip_html(html)
