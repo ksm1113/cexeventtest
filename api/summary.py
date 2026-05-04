@@ -82,15 +82,27 @@ def _http_request(req: urllib.request.Request, timeout: int, label: str) -> byte
 # --- Binance HTML page ---
 def fetch_binance_page(code: str) -> str:
     url = BINANCE_PAGE_URL.format(code=urllib.parse.quote(code, safe="-_.~"))
+    # Full Chrome-style top-level navigation header set. Binance returns a JS
+    # shell to bare requests but a fully rendered page when these are present.
     req = urllib.request.Request(url, headers={
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "identity",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     })
     raw = _http_request(req, TIMEOUT_HTML_SEC, "binance html")
     return raw.decode("utf-8", errors="replace")
